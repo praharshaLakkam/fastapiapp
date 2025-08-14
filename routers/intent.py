@@ -36,21 +36,35 @@ def contains_order_id(text: str) -> bool:
     return bool(re.search(ORDER_ID_PATTERN, text, re.IGNORECASE))
 
 # ----------------------------
+# Fix intent keyword detection
+# ----------------------------
+FIX_KEYWORDS = [
+    "fix", "correct", "modify", "change", "update", "edit", "revise", "adjust", "amend", "repair"
+]
+
+def contains_fix_terms(text: str) -> bool:
+    return any(re.search(rf"\b{kw}\b", text.lower()) for kw in FIX_KEYWORDS)
+
+# ----------------------------
 # Rule-based booster
 # ----------------------------
 def rule_boost(question: str, ml_intent: str) -> str:
     q_lower = question.lower()
 
-    # 1. Detect specific order IDs
+    # 1. Detect specific order IDs or order status inquiries => order status
     if contains_order_id(question) or "order status" in q_lower:
-        return "order-status"
+        return "order status"
 
-    # 2. Detect quantities + product names => BUY
+    # 2. Detect fix-related terms => fix
+    if contains_fix_terms(question):
+        return "fix"
+
+    # 3. Detect quantities + product names => BUY
     if re.search(r"\b\d+\b", q_lower):
         if any(prod in q_lower for prod in ["saep", "sdns", "pillr"]):
             return "buy"
 
-    # 3. Product names without failure keywords => BUY
+    # 4. Product names without failure keywords => BUY
     if any(prod in q_lower for prod in ["saep", "sdns", "pillr"]):
         if not any(word in q_lower for word in ["fail", "error", "issue", "problem", "repair"]):
             return "buy"
@@ -69,15 +83,17 @@ relevance_labels = [
 # Intent labels
 # ----------------------------
 candidate_intents = [
-    "Customer wants support or help with an existing cybersecurity product order (saep, sdns, pillr)",
+    "Customer wants order support or help with an existing cybersecurity product order (saep, sdns, pillr)",
     "Customer wants to place a new order for cybersecurity products (saep, sdns, pillr)",
+    "Customer wants to fix or modify details of an existing cybersecurity product order (saep, sdns, pillr)",
     "This query is unrelated to cybersecurity product orders or support"
 ]
 
 intent_mapping = {
-    candidate_intents[0]: "support",
+    candidate_intents[0]: "order status",
     candidate_intents[1]: "buy",
-    candidate_intents[2]: "other"
+    candidate_intents[2]: "fix",
+    candidate_intents[3]: "other"
 }
 
 # ----------------------------
@@ -96,15 +112,30 @@ def detect_intent(data: QueryRequest):
         }
 
     # Step 1: Relevance check
-    relevance_result = classifier(
-        question,
-        candidate_labels=relevance_labels,
-        multi_label=False
-    )
+    try:
+        relevance_result = classifier(
+            question,
+            candidate_labels=relevance_labels,
+            multi_label=False
+        )
+    except Exception as e:
+        return {
+            "intent": "other",
+            "confidence": 0.0,
+            "reason": f"Relevance check failed: {str(e)}"
+        }
+
+    if not relevance_result.get("labels"):
+        return {
+            "intent": "other",
+            "confidence": 0.0,
+            "reason": "Model returned no relevance labels"
+        }
+
     top_relevance_label = relevance_result["labels"][0]
     relevance_confidence = relevance_result["scores"][0]
     is_ecom_related = (
-        top_relevance_label == relevance_labels[0] and relevance_confidence >= 0.75
+        top_relevance_label == relevance_labels[0]  and relevance_confidence >= 0.40
     )
 
     if not is_ecom_related:
@@ -115,23 +146,38 @@ def detect_intent(data: QueryRequest):
         }
 
     # Step 2: Zero-shot intent classification
-    intent_result = classifier(
-        question,
-        candidate_labels=candidate_intents,
-        multi_label=False
-    )
+    try:
+        intent_result = classifier(
+            question,
+            candidate_labels=candidate_intents,
+            multi_label=False
+        )
+    except Exception as e:
+        return {
+            "intent": "other",
+            "confidence": 0.0,
+            "reason": f"Intent classification failed: {str(e)}"
+        }
+
+    if not intent_result.get("labels"):
+        return {
+            "intent": "other",
+            "confidence": 0.0,
+            "reason": "Model returned no intent labels"
+        }
+
     predicted_label = intent_result["labels"][0]
     confidence = intent_result["scores"][0]
-    ml_intent = intent_mapping[predicted_label]
+    ml_intent = intent_mapping.get(predicted_label, "other")
 
     # Step 3: Apply rule-based booster
     final_intent = rule_boost(question, ml_intent)
 
-    # Step 4: Confidence fallback to 'other' if confidence low and no override
-    if confidence < 0.6 and final_intent == ml_intent:
+    # Step 4: Confidence fallback
+    if confidence < 0.5 and final_intent == ml_intent:
         final_intent = "other"
 
-    # Step 5: Return the final response
+    # Step 5: Return final response
     return {
         "intent": final_intent,
         "confidence": round(float(confidence), 4),
